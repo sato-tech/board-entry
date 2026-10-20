@@ -20,26 +20,97 @@
 </head>
 <body>
 <script>
-// 入口ページ: アプリ(Google Apps Script の画面)を、このページの中に開くだけ。データ・アプリの URL はここに置かない。
+// 入口ページ: アプリ(Google Apps Script の画面)を、このページとして表示するだけ。データ・アプリの URL はここに置かない。
 // - アプリの番号(デプロイ ID)は URL の # の後ろ(#d=…)で受け取る(# の後ろはサーバに送られない)
 // - ?as=… などの欄は、そのままアプリに渡す(アプリの中のボタンは、この入口ページの URL で開き直す)
-// - Google 以外のこのページの中で開くと、Safari は Google のログイン情報を送らないので、
-//   Safari が Google にログインしていても開ける(Google の画面を直接開くと「ファイルを開くことができません」になる)
+// - 画面は fetch で受け取る(?raw=1 → { html })。fetch は Google のログイン情報(Cookie)を付けない(credentials: 'omit')ので、
+//   ブラウザが Google にログインしていても、Google には「ログインなし」で届く。
+//   (以前は iframe で開いていたが、Google にログインしている iPhone の Safari で Google のログインを求められた。2026-10-20)
+// - 書き込みも同じく fetch で送る(下の useFetchForWrites が google.script.run の代わりをする。受け側は GAS の doPost)
+// - 受け取れなかったとき(アプリが古い・通信の形が変わった)は、以前と同じく iframe で開く
 (function () {
   'use strict';
   var m = /(?:^#|&)d=([A-Za-z0-9_-]{20,200})(?:&|$)/.exec(location.hash);
   if (!m) {
-    var p = document.createElement('p');
-    p.className = 'msg';
-    p.textContent = 'URL が正しくありません。送られてきた URL を、最後(# の後ろ)まで含めて開いてください。';
-    document.body.appendChild(p);
+    say('URL が正しくありません。送られてきた URL を、最後(# の後ろ)まで含めて開いてください。');
     return;
   }
-  var f = document.createElement('iframe');
-  f.src = 'https://script.google.com/macros/s/' + m[1] + '/exec' + location.search;
-  f.title = '調整提案ボード';
-  f.setAttribute('allow', 'clipboard-write');
-  document.body.appendChild(f);
+  var exec = 'https://script.google.com/macros/s/' + m[1] + '/exec';
+  var wait = say('読み込んでいます…(はじめは 10 秒ほどかかることがあります)');
+
+  var ctl = typeof AbortController === 'function' ? new AbortController() : null;
+  var timer = setTimeout(function () { if (ctl) ctl.abort(); }, 45000);
+  fetch(exec + (location.search ? location.search + '&' : '?') + 'raw=1', {
+    credentials: 'omit', cache: 'no-store', signal: ctl ? ctl.signal : undefined,
+  }).then(function (res) {
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return res.json();
+  }).then(function (j) {
+    if (!j || typeof j.html !== 'string') throw new Error('形が違います');
+    clearTimeout(timer);
+    show(j.html);
+  }).catch(function () {
+    clearTimeout(timer);
+    frame();
+  });
+
+  function say(text) {
+    var p = document.createElement('p');
+    p.className = 'msg';
+    p.setAttribute('role', 'status');
+    p.textContent = text;
+    document.body.appendChild(p);
+    return p;
+  }
+
+  // 受け取った画面を、このページとして表示する(書き込み用の google.script.run と、Referer を送らない設定を先頭に足す)
+  function show(html) {
+    var head = '<meta name="referrer" content="no-referrer"><script>(' + useFetchForWrites.toString() + ')(' + JSON.stringify(exec) + ');<\/script>';
+    var at = /<head(\s[^>]*)?>/i.exec(html);
+    var page = at ? html.slice(0, at.index + at[0].length) + head + html.slice(at.index + at[0].length) : head + html;
+    document.open();
+    document.write(page);
+    document.close();
+  }
+
+  // 以前の開き方(iframe)。fetch で受け取れなかったときだけ
+  function frame() {
+    if (wait.parentNode) wait.parentNode.removeChild(wait);
+    var f = document.createElement('iframe');
+    f.src = exec + location.search;
+    f.title = '調整提案ボード';
+    f.setAttribute('allow', 'clipboard-write');
+    document.body.appendChild(f);
+  }
+
+  // google.script.run の代わり(画面が使う書き込み 4 つだけ)。表示した画面の中で動く(この関数は文字にして埋め込む)
+  function useFetchForWrites(url) {
+    var API = ['api_addComment', 'api_addComments', 'api_editComment', 'api_deleteComment'];
+    function runner(ok, ng) {
+      var r = {
+        withSuccessHandler: function (f) { return runner(f, ng); },
+        withFailureHandler: function (f) { return runner(ok, f); },
+      };
+      API.forEach(function (fn) {
+        r[fn] = function () {
+          var fail = function (e) { if (ng) ng(e instanceof Error ? e : new Error(String(e))); };
+          fetch(url, {
+            method: 'POST', credentials: 'omit', cache: 'no-store',
+            // text/plain は「単純なリクエスト」なので、Google 側の事前確認(preflight)が要らない
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: JSON.stringify({ fn: fn, args: Array.prototype.slice.call(arguments) }),
+          }).then(function (res) {
+            if (!res.ok) throw new Error('通信できませんでした(' + res.status + ')');
+            return res.json();
+          }).then(function (j) {
+            if (j && Object.prototype.hasOwnProperty.call(j, 'value')) { if (ok) ok(j.value); } else fail(new Error(j && j.error ? j.error : '送れませんでした'));
+          }, fail);
+        };
+      });
+      return r;
+    }
+    window.google = { script: { run: runner(null, null) } };
+  }
 })();
 </script>
 <noscript><p class="msg">JavaScript を有効にしてください。</p></noscript>
