@@ -28,6 +28,8 @@
 //   (以前は iframe で開いていたが、Google にログインしている iPhone の Safari で Google のログインを求められた。2026-10-20)
 // - 書き込みも同じく fetch で送る(下の useFetchForWrites が google.script.run の代わりをする。受け側は GAS の doPost)
 // - 受け取れなかったとき(アプリが古い・通信の形が変わった)は、以前と同じく iframe で開く
+// - ログインの画面(お名前のボタン)が出たら、各お名前の週次ボードを先に受け取っておき、押したらすぐ出す(下の preloadNames)。
+//   Google の応答は 1 回 2〜5 秒かかり、ログインの画面 → 週次ボードで 2 回続けて待たせていた(2026-10-21 の実測)
 (function () {
   'use strict';
   var m = /(?:^#|&)d=([A-Za-z0-9_-]{20,200})(?:&|$)/.exec(location.hash);
@@ -36,6 +38,17 @@
     return;
   }
   var exec = 'https://script.google.com/macros/s/' + m[1] + '/exec';
+  // 先に受け取った週次ボードの受け渡し(このタブの中だけ・押した直後に開き直したこのページが 1 回だけ使い、すぐ消す)
+  var NEXT = 'board-entry:next';
+  // 受け取ってからこれより時間がたったものは使わない(ほかの人の書き込みを見落とさないため。開き直して受け取り直す)
+  var FRESH_MS = 60000;
+  var next = takeNext();
+  if (next !== null) {
+    // このページの読み込みが終わってから差し替える(読み込みの途中で document.open すると、差し替えずに継ぎ足されてしまう)
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { show(next); });
+    else show(next);
+    return;
+  }
   var wait = say('読み込んでいます…(はじめは 10 秒ほどかかることがあります)');
 
   var ctl = typeof AbortController === 'function' ? new AbortController() : null;
@@ -63,9 +76,28 @@
     return p;
   }
 
+  // ログインの画面で先に受け取っておいた、この URL(?as=…)の週次ボード。無い・別の URL・古いときは null。読んだら必ず消す
+  function takeNext() {
+    var text = null;
+    try {
+      text = sessionStorage.getItem(NEXT);
+      sessionStorage.removeItem(NEXT);
+    } catch (e) {
+      return null;
+    }
+    if (!text) return null;
+    try {
+      var o = JSON.parse(text);
+      return o && o.exec === exec && o.search === location.search && typeof o.html === 'string' && Date.now() - o.at < FRESH_MS ? o.html : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
   // 受け取った画面を、このページとして表示する(書き込み用の google.script.run と、Referer を送らない設定を先頭に足す)
   function show(html) {
-    var head = '<meta name="referrer" content="no-referrer"><script>(' + useFetchForWrites.toString() + ')(' + JSON.stringify(exec) + ');<\/script>';
+    var head = '<meta name="referrer" content="no-referrer"><script>(' + useFetchForWrites.toString() + ')(' + JSON.stringify(exec) + ');'
+      + '(' + preloadNames.toString() + ')(' + JSON.stringify(exec) + ',' + JSON.stringify(NEXT) + ');<\/script>';
     var at = /<head(\s[^>]*)?>/i.exec(html);
     var page = at ? html.slice(0, at.index + at[0].length) + head + html.slice(at.index + at[0].length) : head + html;
     document.open();
@@ -110,6 +142,69 @@
       return r;
     }
     window.google = { script: { run: runner(null, null) } };
+  }
+
+  // ログインの画面で: お名前のボタン(この入口ページの ?as=… だけのリンク)ごとに、週次ボードを先に受け取っておく。
+  // 押されたら受け取ったもの(まだなら受け取り終わりを待って)をタブの中に置き、ふつうに開き直す(URL・戻るの動きは変えない)。
+  // 週次ボード(window.__DASHBOARD__ がある画面)では受け取らない(切り替えのボタンのたびに全員分を取りに行かないため)。
+  // 表示した画面の中で動く(この関数は文字にして埋め込む)
+  function preloadNames(url, key) {
+    var MAX = 6;
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.__DASHBOARD__) return;
+      var here = location.origin + location.pathname;
+      var target = function (href) {
+        var u;
+        try { u = new URL(href); } catch (e) { return null; }
+        var keys = [];
+        u.searchParams.forEach(function (v, k) { keys.push(k); });
+        return u.origin + u.pathname === here && u.hash === location.hash && keys.length === 1 && keys[0] === 'as' ? u.search : null;
+      };
+      var ready = {};
+      var list = [];
+      Array.prototype.forEach.call(document.querySelectorAll('a[href]'), function (a) {
+        var s = target(a.href);
+        if (s !== null && list.indexOf(s) < 0) list.push(s);
+      });
+      if (list.length === 0 || list.length > MAX) return;
+      list.forEach(function (s) {
+        ready[s] = fetch(url + s + '&raw=1', { credentials: 'omit', cache: 'no-store' })
+          .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
+          .then(function (j) { return j && typeof j.html === 'string' ? { html: j.html, at: Date.now() } : null; })
+          .catch(function () { return null; });
+      });
+      var going = null;
+      document.addEventListener('click', function (ev) {
+        if (ev.defaultPrevented || ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+        var a = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
+        var s = a ? target(a.href) : null;
+        if (s === null || !ready[s]) return;
+        ev.preventDefault();
+        if (going) return;
+        var label = a.querySelector('i');
+        going = { a: a, label: label, text: label ? label.textContent : '' };
+        a.setAttribute('aria-busy', 'true');
+        if (label) label.textContent = '開いています…';
+        // 古い(1 分を過ぎた)ものは、開き直したページの takeNext が使わずに受け取り直す
+        ready[s].then(function (r) {
+          if (r) {
+            try {
+              sessionStorage.setItem(key, JSON.stringify({ exec: url, search: s, html: r.html, at: r.at }));
+            } catch (e) {
+              // 置けなければ、開き直したページが受け取り直す
+            }
+          }
+          location.href = a.href;
+        });
+      });
+      // 戻るで戻ってきたとき(ページがそのまま残っていた場合)は、もう一度押せるようにする
+      window.addEventListener('pageshow', function (ev) {
+        if (!ev.persisted || !going) return;
+        going.a.removeAttribute('aria-busy');
+        if (going.label) going.label.textContent = going.text;
+        going = null;
+      });
+    });
   }
 })();
 </script>
