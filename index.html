@@ -117,7 +117,7 @@
 
   // google.script.run の代わり(画面が使う書き込み 4 つだけ)。表示した画面の中で動く(この関数は文字にして埋め込む)
   function useFetchForWrites(url) {
-    var API = ['api_addComment', 'api_addComments', 'api_editComment', 'api_deleteComment'];
+    var API = ['api_addComment', 'api_addComments', 'api_editComment', 'api_deleteComment', 'api_setPlan'];
     function runner(ok, ng) {
       var r = {
         withSuccessHandler: function (f) { return runner(f, ng); },
